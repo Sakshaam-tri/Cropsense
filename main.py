@@ -54,7 +54,7 @@ def download_file_if_needed(url: str, path: Path):
     if not url or "YOUR_" in url:
         # user hasn't configured this yet
         raise RuntimeError(f"Google Drive URL for {path.name} is not configured.")
-    resp = requests.get(url, timeout=60)
+    resp = requests.get(url, timeout=6000)
     resp.raise_for_status()
     path.write_bytes(resp.content)
 
@@ -727,3 +727,4 @@ def predict(req: PredictRequest):
         "risk": risk,
         "best_crops": crops_out,
     }
+
