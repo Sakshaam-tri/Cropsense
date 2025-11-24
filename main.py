@@ -10,6 +10,7 @@ import math
 import joblib
 import json
 import numpy as np
+import os
 
 app = FastAPI()
 
@@ -18,47 +19,91 @@ app = FastAPI()
 # ------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # allow all for development
+    allow_origins=["*"],   # for development; later restrict to your frontend domain
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------------------------------------------------
-# PATHS
+# PATHS & GOOGLE DRIVE CONFIG
 # ------------------------------------------------------------------
-BASE_DIR = Path(r"D:\crop-project")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_CACHE_DIR = BASE_DIR / "data_cache"
+MODEL_DIR = DATA_CACHE_DIR / "models"
+DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-PROCESSED_DIR = BASE_DIR / "data" / "processed"
-RAW_DATA_DIR = BASE_DIR / "data"
-MODEL_DIR = BASE_DIR / "models"
+def gdrive_url(file_id: str) -> str:
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+# TODO: put your actual Google Drive file IDs here
+GDRIVE_FILES = {
+    "profit_csv": gdrive_url("1U2-xdy7cpc38HJcP28wVsPidmO1sFI17"),  # remains same
+    "price_csv": gdrive_url("13Ah_-KlGfWLRcsM_qFX8ScxE1xruGxs6"),   # UPDATED ✔
+    "profit_model": gdrive_url("193jLIjrEvRDsufh-qVwMQSvkcRdCdysV"),
+    "profit_features": gdrive_url("1sCWaMerNLSVnR_SRxU8m4rZAM5AtK7rr"),
+    "crop_encoder": gdrive_url("1zNMRZ6IIqXJnXDWDx-E2LMzncebLDBNy"),
+    "season_encoder": gdrive_url("16_tfjGLWCSEywiBBSeSGhwyAYuyQuzQi"),
+}
+
+
+def download_file_if_needed(url: str, path: Path):
+    """Download from Google Drive only if local file is missing."""
+    if path.exists():
+        return
+    if not url or "YOUR_" in url:
+        # user hasn't configured this yet
+        raise RuntimeError(f"Google Drive URL for {path.name} is not configured.")
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    path.write_bytes(resp.content)
+
+# local cached file paths
+PROFIT_CSV_PATH = DATA_CACHE_DIR / "crop_profit_dataset.csv"
+PRICE_CSV_PATH = DATA_CACHE_DIR / "Price_Agriculture_commodities_Week.csv"
+PROFIT_MODEL_PATH = MODEL_DIR / "profit_model.pkl"
+PROFIT_FEATURES_PATH = MODEL_DIR / "profit_features.json"
+CROP_ENCODER_PATH = MODEL_DIR / "crop_encoder.pkl"
+SEASON_ENCODER_PATH = MODEL_DIR / "season_encoder.pkl"
 
 # ------------------------------------------------------------------
-# LOAD DATASETS
+# DOWNLOAD DATASETS & MODELS FROM GOOGLE DRIVE
 # ------------------------------------------------------------------
+df_profit = pd.DataFrame()
+df_price = pd.DataFrame()
 
-# Profit + cost dataset (output of 01_prepare_data.py)
-df_profit = pd.read_csv(PROCESSED_DIR / "crop_profit_dataset.csv")
+try:
+    download_file_if_needed(GDRIVE_FILES["profit_csv"], PROFIT_CSV_PATH)
+    df_profit = pd.read_csv(PROFIT_CSV_PATH)
+except Exception as e:
+    print("ERROR: could not load profit dataset:", e)
 
-df_profit["STATE_U"] = df_profit["State"].astype(str).str.strip().str.upper()
-df_profit["DISTRICT_U"] = df_profit["District"].astype(str).str.strip().str.upper()
-df_profit["CROP_U"] = df_profit["Crop"].astype(str).str.strip().str.upper()
+try:
+    download_file_if_needed(GDRIVE_FILES["price_csv"], PRICE_CSV_PATH)
+    df_price = pd.read_csv(PRICE_CSV_PATH)
+except Exception as e:
+    print("ERROR: could not load price dataset:", e)
 
-if "Season" in df_profit.columns:
-    df_profit["SEASON_U"] = df_profit["Season"].astype(str).str.strip().str.upper()
-else:
-    df_profit["Season"] = "UNKNOWN"
-    df_profit["SEASON_U"] = "UNKNOWN"
+# Normalize columns if data loaded
+if not df_profit.empty:
+    df_profit["STATE_U"] = df_profit["State"].astype(str).str.strip().str.upper()
+    df_profit["DISTRICT_U"] = df_profit["District"].astype(str).str.strip().str.upper()
+    df_profit["CROP_U"] = df_profit["Crop"].astype(str).str.strip().str.upper()
 
-# Price dataset (mandi prices)
-df_price = pd.read_csv(RAW_DATA_DIR / "Price_Agriculture_commodities_Week.csv")
+    if "Season" in df_profit.columns:
+        df_profit["SEASON_U"] = df_profit["Season"].astype(str).str.strip().str.upper()
+    else:
+        df_profit["Season"] = "UNKNOWN"
+        df_profit["SEASON_U"] = "UNKNOWN"
 
-df_price["State"] = df_price["State"].astype(str).str.strip()
-df_price["District"] = df_price["District"].astype(str).str.strip()
-df_price["Commodity"] = df_price["Commodity"].astype(str).str.strip()
+if not df_price.empty:
+    df_price["State"] = df_price["State"].astype(str).str.strip()
+    df_price["District"] = df_price["District"].astype(str).str.strip()
+    df_price["Commodity"] = df_price["Commodity"].astype(str).str.strip()
 
-df_price["STATE_U"] = df_price["State"].str.upper()
-df_price["DISTRICT_U"] = df_price["District"].str.upper()
-df_price["CROP_U"] = df_price["Commodity"].str.upper()
+    df_price["STATE_U"] = df_price["State"].str.upper()
+    df_price["DISTRICT_U"] = df_price["District"].str.upper()
+    df_price["CROP_U"] = df_price["Commodity"].str.upper()
 
 # ------------------------------------------------------------------
 # LOAD PROFIT ML MODEL (RandomForestRegressor)
@@ -67,46 +112,56 @@ PROFIT_MODEL_AVAILABLE = False
 PROFIT_FEATURES: list[str] = []
 crop_le_profit = None
 season_le_profit = None
+feature_means = None
 
 try:
-    profit_model = joblib.load(MODEL_DIR / "profit_model.pkl")
-    with open(MODEL_DIR / "profit_features.json", "r") as f:
+    # Download model artifacts if they exist
+    download_file_if_needed(GDRIVE_FILES["profit_model"], PROFIT_MODEL_PATH)
+    download_file_if_needed(GDRIVE_FILES["profit_features"], PROFIT_FEATURES_PATH)
+    download_file_if_needed(GDRIVE_FILES["crop_encoder"], CROP_ENCODER_PATH)
+
+    # season encoder is optional
+    try:
+        download_file_if_needed(GDRIVE_FILES["season_encoder"], SEASON_ENCODER_PATH)
+        has_season_encoder = True
+    except Exception:
+        has_season_encoder = False
+
+    profit_model = joblib.load(PROFIT_MODEL_PATH)
+
+    with open(PROFIT_FEATURES_PATH, "r") as f:
         PROFIT_FEATURES = json.load(f)
 
-    crop_le_profit = joblib.load(MODEL_DIR / "crop_encoder.pkl")
-    try:
-        season_le_profit = joblib.load(MODEL_DIR / "season_encoder.pkl")
-    except Exception:
-        season_le_profit = None
+    crop_le_profit = joblib.load(CROP_ENCODER_PATH)
+    season_le_profit = joblib.load(SEASON_ENCODER_PATH) if has_season_encoder else None
 
-    # add encoded columns to df_profit (same as in 02_train_profit_model.py)
-    df_profit["Crop_id"] = crop_le_profit.transform(df_profit["Crop"].astype(str))
-    if season_le_profit is not None and "Season" in df_profit.columns:
-        df_profit["Season_id"] = season_le_profit.transform(df_profit["Season"].astype(str))
-    else:
-        df_profit["Season_id"] = 0
+    if not df_profit.empty:
+        df_profit["Crop_id"] = crop_le_profit.transform(df_profit["Crop"].astype(str))
+        if season_le_profit is not None and "Season" in df_profit.columns:
+            df_profit["Season_id"] = season_le_profit.transform(df_profit["Season"].astype(str))
+        else:
+            df_profit["Season_id"] = 0
 
-    missing_cols = [c for c in PROFIT_FEATURES if c not in df_profit.columns]
-    if missing_cols:
-        print("WARNING: Missing columns for profit model:", missing_cols)
+        missing_cols = [c for c in PROFIT_FEATURES if c not in df_profit.columns]
+        if missing_cols:
+            print("WARNING: Missing columns for profit model:", missing_cols)
+        else:
+            PROFIT_MODEL_AVAILABLE = True
+            feature_means = df_profit[PROFIT_FEATURES].mean()
+            print("Profit model and encoders loaded successfully.")
     else:
-        PROFIT_MODEL_AVAILABLE = True
-        print("Profit model and encoders loaded successfully.")
+        print("WARNING: df_profit is empty; ML model disabled.")
+
 except Exception as e:
-    print("Could not load profit model:", e)
+    print("Could not load profit model or encoders:", e)
     PROFIT_MODEL_AVAILABLE = False
     PROFIT_FEATURES = []
-
-# Pre-compute global means for features to fill NaNs
-if PROFIT_MODEL_AVAILABLE and PROFIT_FEATURES:
-    feature_means = df_profit[PROFIT_FEATURES].mean()
-else:
     feature_means = None
 
 # ------------------------------------------------------------------
-# USER & ADMIN DATA (CSV STORAGE)
+# USER & ADMIN DATA (CSV STORAGE - LOCAL)
 # ------------------------------------------------------------------
-USER_DATA_DIR = RAW_DATA_DIR  # same data folder
+USER_DATA_DIR = BASE_DIR / "user_data"
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 USER_CSV_PATH = USER_DATA_DIR / "users.csv"
@@ -114,7 +169,6 @@ ADMIN_CSV_PATH = USER_DATA_DIR / "admins.csv"
 
 USER_COLUMNS = ["username", "password", "created_at", "role"]
 ADMIN_COLUMNS = ["username", "password", "created_at", "role"]
-
 
 def load_users() -> pd.DataFrame:
     if USER_CSV_PATH.exists():
@@ -126,10 +180,8 @@ def load_users() -> pd.DataFrame:
     else:
         return pd.DataFrame(columns=USER_COLUMNS)
 
-
 def save_users(df_users: pd.DataFrame):
     df_users.to_csv(USER_CSV_PATH, index=False)
-
 
 def load_admins() -> pd.DataFrame:
     if ADMIN_CSV_PATH.exists():
@@ -157,7 +209,6 @@ def load_admins() -> pd.DataFrame:
         df_admins.to_csv(ADMIN_CSV_PATH, index=False)
 
     return df_admins[ADMIN_COLUMNS]
-
 
 def save_admins(df_admins: pd.DataFrame):
     df_admins.to_csv(ADMIN_CSV_PATH, index=False)
@@ -242,13 +293,11 @@ MONTH_MAP = {
     "DECEMBER": 12,
 }
 
-
 def month_to_number(m: str) -> int:
     if not m:
         return 1
     m = m.strip().upper()
     return MONTH_MAP.get(m, 1)
-
 
 def month_to_season(m_num: int) -> str:
     if 6 <= m_num <= 9:
@@ -258,13 +307,11 @@ def month_to_season(m_num: int) -> str:
     else:
         return "ZAID"
 
-
 def crop_pref_season(crop_u: str) -> Optional[str]:
     for key, season in CROP_SEASON_PREF.items():
         if key in crop_u:
             return season
     return None
-
 
 def adjust_profit(base_profit: float, crop_name: str, month: str) -> float:
     month_num = month_to_number(month)
@@ -283,7 +330,6 @@ def adjust_profit(base_profit: float, crop_name: str, month: str) -> float:
     month_factor = 1.0 + 0.1 * math.sin(angle)
 
     return base_profit * season_factor * month_factor
-
 
 def adjust_market_price(base_price: Optional[float], crop_name: str, month: str) -> Optional[float]:
     if base_price is None:
@@ -313,7 +359,6 @@ class PredictRequest(BaseModel):
     district: str
     month: str
 
-
 class UserCredentials(BaseModel):
     username: str
     password: str
@@ -335,7 +380,6 @@ def geocode(state: str, district: str):
         return float(first["latitude"]), float(first["longitude"])
     except Exception:
         return None, None
-
 
 def get_weather(lat: float, lon: float):
     url = "https://api.open-meteo.com/v1/forecast"
@@ -363,7 +407,6 @@ def get_weather(lat: float, lon: float):
             "precip_mm": None,
         }
 
-
 def get_river_discharge(lat: float, lon: float):
     url = "https://flood-api.open-meteo.com/v1/flood"
     params = {
@@ -382,7 +425,6 @@ def get_river_discharge(lat: float, lon: float):
         return None
     except Exception:
         return None
-
 
 def compute_risk(weather: dict, discharge: Optional[float]):
     temp = weather.get("temp") or 30.0
@@ -433,39 +475,35 @@ def compute_risk(weather: dict, discharge: Optional[float]):
 # ------------------------------------------------------------------
 # PRECOMPUTE LOCATIONS FOR DROPDOWNS
 # ------------------------------------------------------------------
-# Use df_profit to know which (State, District) actually have data
-loc_df = df_profit[
-    ["State", "STATE_U", "District", "DISTRICT_U"]
-].dropna().drop_duplicates()
-
-locations_map: Dict[str, Dict[str, Any]] = {}
-
-for _, row in loc_df.iterrows():
-    state_name = str(row["State"]).strip()
-    state_u = str(row["STATE_U"]).strip()
-    district_name = str(row["District"]).strip()
-
-    if state_u not in locations_map:
-        locations_map[state_u] = {
-            "state": state_name,
-            "state_u": state_u,
-            "districts": set(),
-        }
-    locations_map[state_u]["districts"].add(district_name)
-
-# convert sets to sorted lists
 LOCATIONS: List[Dict[str, Any]] = []
-for st_u, info in locations_map.items():
-    LOCATIONS.append(
-        {
-            "state": info["state"],
-            "state_u": info["state_u"],
-            "districts": sorted(list(info["districts"])),
-        }
-    )
+if not df_profit.empty:
+    loc_df = df_profit[
+        ["State", "STATE_U", "District", "DISTRICT_U"]
+    ].dropna().drop_duplicates()
 
-# sort by state name for nicer dropdown
-LOCATIONS = sorted(LOCATIONS, key=lambda x: x["state"])
+    locations_map: Dict[str, Dict[str, Any]] = {}
+    for _, row in loc_df.iterrows():
+        state_name = str(row["State"]).strip()
+        state_u = str(row["STATE_U"]).strip()
+        district_name = str(row["District"]).strip()
+
+        if state_u not in locations_map:
+            locations_map[state_u] = {
+                "state": state_name,
+                "state_u": state_u,
+                "districts": set(),
+            }
+        locations_map[state_u]["districts"].add(district_name)
+
+    for st_u, info in locations_map.items():
+        LOCATIONS.append(
+            {
+                "state": info["state"],
+                "state_u": info["state_u"],
+                "districts": sorted(list(info["districts"])),
+            }
+        )
+    LOCATIONS = sorted(LOCATIONS, key=lambda x: x["state"])
 
 # ------------------------------------------------------------------
 # AUTH ROUTES
@@ -490,7 +528,6 @@ def user_signup(user: UserCredentials):
         "role": "user",
     }
 
-
 @app.post("/api/user/login")
 def user_login(user: UserCredentials):
     df_users = load_users()
@@ -509,7 +546,6 @@ def user_login(user: UserCredentials):
         "role": "user",
     }
 
-
 @app.post("/api/user/delete")
 def user_delete(user: UserCredentials):
     df_users = load_users()
@@ -525,7 +561,6 @@ def user_delete(user: UserCredentials):
     df_users = df_users.loc[~mask].reset_index(drop=True)
     save_users(df_users)
     return {"message": "Account deleted successfully."}
-
 
 @app.post("/api/admin/login")
 def admin_login(user: UserCredentials):
@@ -552,23 +587,8 @@ def root():
     else:
         return {"message": "Crop backend using historical profit + mandi price + live weather/river (ML model not loaded)"}
 
-
 @app.get("/api/locations")
 def get_locations():
-    """
-    Returns states and their districts where we have profit dataset.
-    Example:
-    {
-      "locations": [
-        {
-          "state": "Punjab",
-          "state_u": "PUNJAB",
-          "districts": ["Amritsar", "Ludhiana", ...]
-        },
-        ...
-      ]
-    }
-    """
     return {"locations": LOCATIONS}
 
 # ------------------------------------------------------------------
@@ -576,12 +596,14 @@ def get_locations():
 # ------------------------------------------------------------------
 @app.post("/api/predict")
 def predict(req: PredictRequest):
+    if df_profit.empty:
+        return {"error": "Profit dataset not loaded on server."}
+
     state_u = req.state.strip().upper()
     district_u = req.district.strip().upper()
     month_num = month_to_number(req.month)
     season_u = month_to_season(month_num)
 
-    # Filter profit data
     sub = df_profit[(df_profit["STATE_U"] == state_u) & (df_profit["DISTRICT_U"] == district_u)]
     if sub.empty:
         return {"error": "No historical data for this state & district."}
@@ -595,7 +617,7 @@ def predict(req: PredictRequest):
         return {"error": "No data for this state, district and season."}
 
     # ---------------- ML PROFIT PREDICTION ----------------
-    if PROFIT_MODEL_AVAILABLE and PROFIT_FEATURES:
+    if PROFIT_MODEL_AVAILABLE and PROFIT_FEATURES and feature_means is not None:
         X_sub = sub[PROFIT_FEATURES].copy()
         X_sub = X_sub.fillna(feature_means)
         y_pred_sub = profit_model.predict(X_sub)
@@ -612,7 +634,6 @@ def predict(req: PredictRequest):
         if "cost_per_ha" in grouped.columns:
             grouped = grouped.rename(columns={"cost_per_ha": "avg_cost_per_ha"})
     else:
-        # fallback: purely historical mean profit per ha
         agg_dict = {"profit_per_ha": "mean"}
         if "cost_per_ha" in sub.columns:
             agg_dict["cost_per_ha"] = "mean"
@@ -633,7 +654,6 @@ def predict(req: PredictRequest):
     grouped = grouped.sort_values("adj_profit_per_ha", ascending=False)
     top3 = grouped.head(3)
 
-    # location & weather
     lat, lon = geocode(req.state, req.district)
     if lat is None or lon is None:
         lat, lon = 23.5, 80.5
@@ -654,17 +674,17 @@ def predict(req: PredictRequest):
             else None
         )
 
-        # mandi price
-        sub_price = df_price[
-            (df_price["STATE_U"] == state_u)
-            & (df_price["DISTRICT_U"] == district_u)
-            & (df_price["CROP_U"] == crop_u)
-        ]
+        sub_price = pd.DataFrame()
+        if not df_price.empty:
+            sub_price = df_price[
+                (df_price["STATE_U"] == state_u)
+                & (df_price["DISTRICT_U"] == district_u)
+                & (df_price["CROP_U"] == crop_u)
+            ]
+            if sub_price.empty:
+                sub_price = df_price[df_price["CROP_U"] == crop_u]
 
-        if sub_price.empty:
-            sub_price = df_price[df_price["CROP_U"] == crop_u]
-
-        if "Modal Price" in df_price.columns:
+        if not df_price.empty and "Modal Price" in df_price.columns:
             if not sub_price.empty:
                 base_price = float(sub_price["Modal Price"].mean())
             else:
